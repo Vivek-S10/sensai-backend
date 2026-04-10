@@ -1,13 +1,15 @@
 import os
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
-from typing import AsyncGenerator, Optional, Dict
+from typing import AsyncGenerator, Optional, Dict, Literal, List
+import uuid
 import json
 from copy import deepcopy
 from pydantic import BaseModel, Field, create_model
 from api.config import openai_plan_to_model_name
 from api.models import (
     AIChatRequest,
+    AssessmentTopicsChatRequest,
     ChatResponseType,
     TaskType,
     QuestionType,
@@ -1011,3 +1013,278 @@ async def ai_response_for_assignment(request: AIChatRequest):
         stream_response(),
         media_type="application/x-ndjson",
     )
+
+@router.post("/assessment/topics-chat")
+async def ai_response_for_assessment_topics(request: AssessmentTopicsChatRequest):
+    # Define an async generator for streaming
+    async def stream_response() -> AsyncGenerator[str, None]:
+        with langfuse.start_as_current_span(
+            name="assessment_topics_chat",
+        ) as trace:
+            metadata = {
+                "task_id": request.task_id,
+                "user_id": request.user_id,
+                "type": "assessment_curriculum",
+            }
+            
+            user_details = await get_user_details_for_prompt(str(request.user_id))
+            
+            # Construct the system message
+            system_prompt = """You are an expert curriculum designer. The user will provide a curriculum, topics, or Job Description (JD). 
+Your task is to extract the main topics and skills. Assign a weightage (%) to each topic based on its importance, ensuring the total is exactly 100%. 
+You must also specify how many MCQs and Coding questions will be generated per topic, and explicitly state the assigned points for each question. 
+IMPORTANT LIMIT: At this stage, restrict the cumulative sum of all questions across all topics to exactly 10 questions maximum to ensure reliable generation later.
+If the user requests modifications (e.g., 'reduce weight of X', 'add Y', 'I want 5 more coding questions'), adjust the topics, weights, question counts, and points accordingly while maintaining the 100% total and the 10 question limit.
+Format your response cleanly using Markdown, with a visible table including the following columns: Topic, Weightage %, # of MCQs, # of Coding Questions, Points per MCQ, Points per Coding Question.
+Do NOT generate the actual questions. ONLY discuss and refine the curriculum structure."""
+
+            if user_details:
+                system_prompt += f"\n\nUser details:\n{user_details}"
+
+            messages = [{"role": "system", "content": system_prompt}]
+            
+            # Format chat history
+            chat_history = []
+            for message in request.chat_history:
+                chat_history.append({"role": message["role"], "content": message["content"]})
+                
+            messages.extend(chat_history)
+            
+            # Add the new message
+            messages.append({"role": "user", "content": request.new_message})
+
+            model = openai_plan_to_model_name["text"]
+            
+            class Output(BaseModel):
+                response: str = Field(
+                    description="Response to the user's input, formatted in Markdown, including a table of topics and weightages (adding up to 100%)."
+                )
+                
+            llm_input = json.dumps(messages)
+            llm_output = ""
+
+            with langfuse.start_as_current_observation(
+                as_type="generation", name="response",
+            ) as observation:
+                try:
+                    async for chunk in stream_llm_with_openai(
+                        model=model,
+                        messages=messages,
+                        response_model=Output,
+                        max_output_tokens=4096,
+                        api_mode="responses",
+                    ):
+                        content = json.dumps(chunk.model_dump()) + "\n"
+                        llm_output = chunk.model_dump()
+                        yield content
+                except Exception as e:
+                    if str(e) == "'AsyncStream' object has no attribute 'aclose'":
+                        pass
+                    else:
+                        raise
+                finally:
+                    observation.update(
+                        input=llm_input,
+                        output=llm_output,
+                        metadata=metadata,
+                    )
+
+            trace.update_trace(
+                user_id=str(request.user_id),
+                session_id=f"assessment_topics_{request.task_id}_{request.user_id}",
+                metadata=metadata,
+                input=llm_input,
+                output=llm_output,
+            )
+
+    return StreamingResponse(
+        stream_response(),
+        media_type="application/x-ndjson",
+    )
+
+def text_to_blocks(text: str) -> List[Dict]:
+    return [
+        {
+            "id": str(uuid.uuid4()),
+            "type": "paragraph",
+            "props": {"textColor": "default", "backgroundColor": "default", "textAlignment": "left"},
+            "content": [{"type": "text", "text": line, "styles": {}}]
+        }
+        for line in text.split('\n') if line.strip()
+    ]
+
+@router.post("/assessment/generate-questions")
+async def generate_questions(request: AssessmentTopicsChatRequest):
+    # Prepare prompt
+    system_prompt = """You are an expert curriculum designer and exam creator. 
+The user will provide a structured final chat history of a curriculum breakdown, which includes topics, weightages, points, and exactly how many MCQs and Coding questions must be generated for each topic.
+Your task is to generate EXACTLY the requested questions based on the final agreed upon table in the chat history.
+Each question MUST adhere to the requested point value, difficulty, and topic.
+For MCQs, provide the full question text including the options natively inside the text block, and clearly indicate the correct option in the answer block.
+For Coding questions, provide the problem statement in the question block, the expected correct logic/code in the answer block, the applicable coding languages, and a few succinct grading criteria (e.g. 'Handles edge cases', 'Optimal time complexity').
+"""
+    
+    messages = [{"role": "system", "content": system_prompt}]
+    for message in request.chat_history:
+         messages.append({"role": message["role"], "content": message["content"]})
+    messages.append({"role": "user", "content": "Proceed to generate all the questions now as structured JSON."})
+
+    class LLMGeneratedQuestion(BaseModel):
+        title: str = Field(description="A short descriptive title for the question")
+        topic: str
+        difficulty: str = Field(description="E.g. Easy, Medium, Hard")
+        points: int
+        question_type: Literal["mcq", "coding"]
+        question_text: str = Field(description="The full question properly formatted. Include options if MCQ.")
+        answer_text: str = Field(description="The correct answer or reference solution properly formatted.")
+        coding_languages: Optional[List[str]] = Field(None, description="For coding questions, a list of languages like ['python', 'javascript']. NULL for MCQ.")
+        scorecard_criteria: Optional[List[str]] = Field(None, description="For coding questions, a list of testing criteria like ['Handles edge cases', 'Optimal']. NULL for MCQ.")
+
+    class Output(BaseModel):
+        questions: List[LLMGeneratedQuestion]
+
+    model = openai_plan_to_model_name["text"]
+    
+    with langfuse.start_as_current_observation(as_type="generation", name="generate_questions") as observation:
+        response = await run_llm_with_openai(
+            model=model,
+            messages=messages,
+            response_model=Output,
+            max_output_tokens=16383,
+            api_mode="responses"
+        )
+        observation.update(
+            input=json.dumps(messages),
+            output=response.model_dump(),
+            metadata={"task_id": request.task_id}
+        )
+
+    # Convert LLM model to Frontend QuizQuestion structure
+    frontend_questions = []
+    for q in response.questions:
+        q_id = str(uuid.uuid4())
+        
+        # Base config
+        config = {
+            "title": q.title,
+            "responseType": "exam",
+            "settings": {"topic": q.topic, "difficulty": q.difficulty, "points": q.points, "allowCopyPaste": False},
+            "knowledgeBaseBlocks": [],
+            "linkedMaterialIds": [],
+        }
+        
+        if q.question_type == "mcq":
+            config["questionType"] = "objective"
+            config["inputType"] = "text"
+            config["correctAnswer"] = text_to_blocks(q.answer_text)
+        else: # coding
+            config["questionType"] = "subjective"
+            config["inputType"] = "code"
+            config["codingLanguages"] = q.coding_languages or ["python"]
+            config["correctAnswer"] = text_to_blocks(q.answer_text)
+            
+            # create scorecard criteria
+            criteria_list = q.scorecard_criteria or ["Correct Logic", "Efficient Solution"]
+            config["scorecardData"] = {
+                "title": f"{q.title} Scorecard",
+                "criteria": [
+                    {
+                        "name": crit,
+                        "description": crit,
+                        "min_score": 0,
+                        "max_score": 10,
+                        "pass_score": 5
+                    } for crit in criteria_list
+                ]
+            }
+
+        frontend_questions.append({
+            "id": q_id,
+            "content": text_to_blocks(q.question_text),
+            "config": config
+        })
+        
+    return frontend_questions
+
+class AssessmentEditQuestionRequest(BaseModel):
+    task_id: int
+    user_prompt: str
+    original_question_text: str
+    original_answer_text: str
+    metadata: Dict
+    question_type: str
+
+@router.post("/assessment/edit-question")
+async def edit_question(request: AssessmentEditQuestionRequest):
+    system_prompt = f"""You are an expert curriculum designer and exam creator. 
+The user previously generated an assessment question but wants to specifically edit it.
+You must address their requested changes precisely.
+
+Here is the original configuration:
+Topic: {request.metadata.get('topic')}
+Difficulty: {request.metadata.get('difficulty')}
+Points: {request.metadata.get('points')}
+Format requested: {request.question_type}
+
+Original Question:
+{request.original_question_text}
+
+Original Reference Answer:
+{request.original_answer_text}
+
+The user's specific edit command is: "{request.user_prompt}"
+Rewrite the question and answer to fulfill this command. Ensure you map everything exactly as required to a valid {request.question_type} question.
+"""
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": "Return the updated question."}
+    ]
+
+    class LLMEditedQuestion(BaseModel):
+        title: str = Field(description="A short descriptive title for the question")
+        question_text: str = Field(description="The full edited question. Include options natively in text if MCQ.")
+        answer_text: str = Field(description="The correct edited answer or reference solution.")
+        coding_languages: Optional[List[str]] = Field(None, description="For coding questions only.")
+        scorecard_criteria: Optional[List[str]] = Field(None, description="For coding questions only.")
+
+    model = openai_plan_to_model_name["text"]
+    response = await run_llm_with_openai(
+        model=model,
+        messages=messages,
+        response_model=LLMEditedQuestion,
+        max_output_tokens=4096,
+        api_mode="responses"
+    )
+
+    q = response
+    config = {
+        "title": q.title,
+        "responseType": "exam",
+        "settings": request.metadata, # Preserve original
+        "knowledgeBaseBlocks": [],
+        "linkedMaterialIds": [],
+    }
+    
+    if request.question_type == 'mcq' or request.question_type == 'objective':
+        config["questionType"] = "objective"
+        config["inputType"] = "text"
+        config["correctAnswer"] = text_to_blocks(q.answer_text)
+    else:
+        config["questionType"] = "subjective"
+        config["inputType"] = "code"
+        config["codingLanguages"] = q.coding_languages or ["python"]
+        config["correctAnswer"] = text_to_blocks(q.answer_text)
+        criteria_list = q.scorecard_criteria or ["Correct Logic"]
+        config["scorecardData"] = {
+            "title": f"{q.title} Scorecard",
+            "criteria": [
+                {"name": c, "description": c, "min_score": 0, "max_score": 10, "pass_score": 5}
+                for c in criteria_list
+            ]
+        }
+
+    return {
+        "content": text_to_blocks(q.question_text),
+        "config": config
+    }

@@ -241,7 +241,7 @@ async def get_task(task_id: int):
 
         task_data["blocks"] = json.loads(result[0]) if result[0] else []
 
-    elif task_data["type"] == TaskType.QUIZ:
+    elif task_data["type"] in [TaskType.QUIZ, TaskType.ASSESSMENT]:
         questions = await execute_db_operation(
             f"""
             SELECT q.id, q.type, q.blocks, q.answer, q.input_type, q.response_type, qs.scorecard_id, q.context, q.coding_language, q.max_attempts, q.is_feedback_shown, q.title, q.settings
@@ -661,7 +661,7 @@ async def duplicate_task(task_id: int, course_id: int, milestone_id: int) -> int
             None,
             TaskStatus.DRAFT,
         )
-    elif task["type"] == TaskType.QUIZ:
+    elif task["type"] in [TaskType.QUIZ, TaskType.ASSESSMENT]:
         for question in task["questions"]:
             question.pop("id", None)
 

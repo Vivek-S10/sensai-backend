@@ -1,5 +1,5 @@
 from enum import Enum
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import List, Tuple, Optional, Dict, Literal, Any
 from datetime import datetime
 
@@ -190,6 +190,7 @@ class TaskType(Enum):
     QUIZ = "quiz"
     LEARNING_MATERIAL = "learning_material"
     ASSIGNMENT = "assignment"
+    ASSESSMENT = "assessment"
 
     def __str__(self):
         return self.value
@@ -718,6 +719,12 @@ class AIChatRequest(BaseModel):
     task_id: int
     response_type: Optional[ChatResponseType] = None
 
+
+class AssessmentTopicsChatRequest(BaseModel):
+    chat_history: List[Dict] = Field(default_factory=list)
+    new_message: str
+    user_id: int
+    task_id: int
 
 class MarkTaskCompletedRequest(BaseModel):
     user_id: int
