@@ -117,6 +117,35 @@ async def update_published_quiz(
     return result
 
 
+@router.post("/{task_id}/assessment", response_model=QuizTask)
+async def update_draft_assessment(task_id: int, request: UpdateDraftQuizRequest) -> QuizTask:
+    result = await update_draft_quiz_in_db(
+        task_id=task_id,
+        title=request.title,
+        questions=request.questions,
+        scheduled_publish_at=request.scheduled_publish_at,
+        status=request.status,
+    )
+    if not result:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return result
+
+
+@router.put("/{task_id}/assessment", response_model=QuizTask)
+async def update_published_assessment(
+    task_id: int, request: UpdatePublishedQuizRequest
+) -> QuizTask:
+    result = await update_published_quiz_in_db(
+        task_id=task_id,
+        title=request.title,
+        questions=request.questions,
+        scheduled_publish_at=request.scheduled_publish_at,
+    )
+    if not result:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return result
+
+
 @router.post("/duplicate", response_model=DuplicateTaskResponse)
 async def duplicate_task(
     request: DuplicateTaskRequest,
