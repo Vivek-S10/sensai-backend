@@ -166,7 +166,7 @@ async def get_task_chat_history_for_user(
     if task["type"] == TaskType.LEARNING_MATERIAL:
         raise ValueError("Task is not a quiz or assignment")
 
-    if task["type"] == TaskType.QUIZ:
+    if task["type"] == TaskType.QUIZ or task["type"] == TaskType.ASSESSMENT:
         # For quiz tasks, get chat history through questions
         query = f"""
             SELECT ch.id, ch.created_at, ch.user_id, ch.question_id, ch.role, ch.content, ch.response_type

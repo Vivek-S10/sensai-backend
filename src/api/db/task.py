@@ -617,8 +617,8 @@ async def update_published_quiz(
 
         # Update task status to published
         await cursor.execute(
-            f"UPDATE {tasks_table_name} SET title = ?, scheduled_publish_at = ? WHERE id = ?",
-            (title, scheduled_publish_at, task_id),
+            f"UPDATE {tasks_table_name} SET status = ?, title = ?, scheduled_publish_at = ? WHERE id = ?",
+            (str(TaskStatus.PUBLISHED), title, scheduled_publish_at, task_id),
         )
 
         await conn.commit()

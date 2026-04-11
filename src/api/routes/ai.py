@@ -1,10 +1,13 @@
 import os
+import asyncio
+import traceback
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
-from typing import AsyncGenerator, Optional, Dict, Literal, List
+from typing import AsyncGenerator, Optional, Dict, Literal, List, Any
 import uuid
 import json
 from copy import deepcopy
+from contextlib import nullcontext
 from pydantic import BaseModel, Field, create_model
 from api.config import openai_plan_to_model_name
 from api.models import (
@@ -44,6 +47,54 @@ router = APIRouter()
 langfuse = get_client()
 
 LANGFUSE_PROMPT_LABEL = settings.langfuse_tracing_environment
+LANGFUSE_ENABLED = bool(
+    settings.langfuse_public_key
+    and settings.langfuse_secret_key
+    and settings.langfuse_host
+    and settings.langfuse_tracing_environment
+)
+
+
+def _prompt_metadata(prompt: Any) -> dict[str, Any]:
+    if prompt is None:
+        return {}
+
+    return {
+        "prompt_version": prompt.version,
+        "prompt_name": prompt.name,
+    }
+
+
+def _get_langfuse_prompt(prompt_name: str, **compile_kwargs):
+    try:
+        prompt = langfuse.get_prompt(
+            prompt_name, type="chat", label=LANGFUSE_PROMPT_LABEL
+        )
+        messages = prompt.compile(**compile_kwargs)
+        return prompt, messages
+    except Exception as e:
+        print(f"Failed to get prompt from Langfuse ({prompt_name}): {e}")
+        return None, None
+
+
+class _NoopLangfuseContext:
+    def update(self, *args, **kwargs):
+        return None
+
+    def update_trace(self, *args, **kwargs):
+        return None
+
+
+def _start_span(name: str):
+    if LANGFUSE_ENABLED:
+        return langfuse.start_as_current_span(name=name)
+    return nullcontext(_NoopLangfuseContext())
+
+
+def _start_observation(**kwargs):
+    if LANGFUSE_ENABLED:
+        return langfuse.start_as_current_observation(**kwargs)
+    return nullcontext(_NoopLangfuseContext())
 
 
 def convert_chat_history_to_prompt(chat_history: list[dict]) -> str:
@@ -133,14 +184,28 @@ async def rewrite_query(
     is_root_trace: bool = False,
 ):
     # rewrite query
-    prompt = langfuse.get_prompt(
-        "rewrite-query", type="chat", label=LANGFUSE_PROMPT_LABEL
-    )
-
-    messages = prompt.compile(
+    prompt, messages = _get_langfuse_prompt(
+        "rewrite-query",
         chat_history=convert_chat_history_to_prompt(chat_history),
         reference_material=question_details,
     )
+    if messages is None:
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Rewrite the student's latest message to be clear, concise, and "
+                    "well-structured while preserving original meaning and intent."
+                ),
+            },
+            {
+                "role": "system",
+                "content": (
+                    "Reference material for grounding (do not invent beyond this):\n\n"
+                    f"{question_details}"
+                ),
+            },
+        ]
 
     model = openai_plan_to_model_name["text-mini"]
 
@@ -167,18 +232,18 @@ async def rewrite_query(
         langfuse_update_fn = langfuse.update_current_generation
 
     output = pred.rewritten_query
-    langfuse_update_fn(
-        input=llm_input,
-        output=output,
-        metadata={
-            "prompt_version": prompt.version,
-            "prompt_name": prompt.name,
-            "input": llm_input,
-            "output": output,
-        },
-    )
+    if LANGFUSE_ENABLED:
+        langfuse_update_fn(
+            input=llm_input,
+            output=output,
+            metadata={
+                **_prompt_metadata(prompt),
+                "input": llm_input,
+                "output": output,
+            },
+        )
 
-    if user_id is not None and is_root_trace:
+    if LANGFUSE_ENABLED and user_id is not None and is_root_trace:
         langfuse.update_current_trace(
             user_id=user_id,
         )
@@ -201,11 +266,17 @@ async def get_model_for_task(
             description="Whether to use a reasoning model to evaluate the student's response"
         )
 
-    prompt = langfuse.get_prompt("router", type="chat", label=LANGFUSE_PROMPT_LABEL)
-
-    messages = prompt.compile(
+    prompt, messages = _get_langfuse_prompt(
+        "router",
         task_details=question_details,
     )
+    if messages is None:
+        messages = [
+            {
+                "role": "system",
+                "content": f"You are a router that decides whether to use a reasoning model (o3-mini) or a general-purpose model (gpt-4o-mini) for the following task:\n\n{question_details}",
+            }
+        ]
 
     messages += chat_history
 
@@ -231,18 +302,18 @@ async def get_model_for_task(
     else:
         langfuse_update_fn = langfuse.update_current_generation
 
-    langfuse_update_fn(
-        input=llm_input,
-        output=use_reasoning_model,
-        metadata={
-            "prompt_version": prompt.version,
-            "prompt_name": prompt.name,
-            "input": llm_input,
-            "output": use_reasoning_model,
-        },
-    )
+    if LANGFUSE_ENABLED:
+        langfuse_update_fn(
+            input=llm_input,
+            output=use_reasoning_model,
+            metadata={
+                **_prompt_metadata(prompt),
+                "input": llm_input,
+                "output": use_reasoning_model,
+            },
+        )
 
-    if user_id is not None and is_root_trace:
+    if LANGFUSE_ENABLED and user_id is not None and is_root_trace:
         langfuse.update_current_trace(
             user_id=user_id,
         )
@@ -363,7 +434,7 @@ async def get_user_details_for_prompt(user_id: str) -> str:
 async def ai_response_for_question(request: AIChatRequest):
     # Define an async generator for streaming
     async def stream_response() -> AsyncGenerator[str, None]:
-        with langfuse.start_as_current_span(
+        with _start_span(
             name="ai_chat",
         ) as trace:
             metadata = {
@@ -495,6 +566,7 @@ async def ai_response_for_question(request: AIChatRequest):
                     question["blocks"]
                 )
                 question_details = f"**Task**\n\n{question_description}\n\n"
+                objective_reference = None
 
             task_metadata = await get_task_metadata(request.task_id)
             if task_metadata:
@@ -525,6 +597,7 @@ async def ai_response_for_question(request: AIChatRequest):
                         question["answer"]
                     )
                     question_details += f"---\n\n**Reference Solution (never to be shared with the learner)**\n\n{answer_as_prompt}\n\n"
+                    objective_reference = answer_as_prompt
                 else:
                     scorecard_as_prompt = convert_scorecard_to_prompt(
                         question["scorecard"]
@@ -552,8 +625,57 @@ async def ai_response_for_question(request: AIChatRequest):
             metadata.update(response_metadata)
 
             llm_output = ""
+            if (
+                request.task_type == TaskType.QUIZ
+                and question["type"] == QuestionType.OBJECTIVE
+                and not LANGFUSE_ENABLED
+            ):
+                latest_submission = (
+                    new_user_message[0]["content"] if new_user_message else ""
+                )
+                def normalize(text: str) -> str:
+                    return text.strip().casefold()
+
+                is_correct = (
+                    normalize(latest_submission)
+                    == normalize(objective_reference or "")
+                    if objective_reference
+                    else False
+                )
+                feedback = (
+                    "Your answer is correct."
+                    if is_correct
+                    else "Your answer is incorrect. Please try again."
+                )
+                analysis = (
+                    "Answer judged correct."
+                    if is_correct
+                    else "Answer judged incorrect."
+                )
+                llm_output = {
+                    "analysis": analysis,
+                    "feedback": feedback,
+                    "is_correct": is_correct,
+                }
+                metadata["output"] = llm_output
+                session_id = f"quiz_{request.task_id}_{request.question_id}_{request.user_id}"
+                trace.update_trace(
+                    user_id=str(request.user_id),
+                    session_id=session_id,
+                    metadata=metadata,
+                    input=llm_input,
+                    output=llm_output,
+                )
+                yield json.dumps(llm_output) + "\n"
+                return
             if request.task_type == TaskType.QUIZ:
                 if question["type"] == QuestionType.OBJECTIVE:
+                    is_assessment_mode = question.get("response_type") != "chat"
+
+                    class ComponentSkill(BaseModel):
+                        sub_topic: str = Field(description="The specific granular skill being tested (e.g., 'Array Iteration', 'Pointer Arithmetic')")
+                        competency_score: float = Field(description="Score out of 100 representing the user's mastery of this specific sub-topic")
+                        analysis: str = Field(description="1-2 sentences explaining why they got this score, pinpointing exactly where they showed strength or weakness.")
 
                     class Output(BaseModel):
                         analysis: str = Field(
@@ -564,6 +686,10 @@ async def ai_response_for_question(request: AIChatRequest):
                         )
                         is_correct: bool = Field(
                             description="Whether the student's response correctly solves the original task that the student is supposed to solve. For this to be true, the original task needs to be completely solved and not just partially solved. Giving the right answer to one step of the task does not count as solving the entire task."
+                        )
+                        competency_map: Optional[List[ComponentSkill]] = Field(
+                            description="A granular breakdown of the specific micro-skills demonstrated in this test.",
+                            default=[]
                         )
 
                 else:
@@ -609,6 +735,11 @@ async def ai_response_for_question(request: AIChatRequest):
                         ]
                     )
 
+                    class ComponentSkillSubjective(BaseModel):
+                        sub_topic: str = Field(description="The specific granular skill being tested")
+                        competency_score: float = Field(description="Score out of 100")
+                        analysis: str = Field(description="Brief analysis for this skill.")
+
                     class Output(BaseModel):
                         chain_of_thought: str = Field(
                             description="Concise analysis of the student's response and what the scorecard should be."
@@ -618,6 +749,10 @@ async def ai_response_for_question(request: AIChatRequest):
                         )
                         scorecard: Optional[Scorecard] = Field(
                             description="Score and feedback for each criterion from the scoring criteria; only include this in the response if the student's response is a valid response to the task"
+                        )
+                        competency_map: Optional[List[ComponentSkillSubjective]] = Field(
+                            description="A granular breakdown of the specific micro-skills demonstrated in this test.",
+                            default=[]
                         )
 
             else:
@@ -642,25 +777,94 @@ async def ai_response_for_question(request: AIChatRequest):
                 else:
                     prompt_name = "subjective-question"
 
-                prompt = langfuse.get_prompt(
-                    prompt_name, type="chat", label=LANGFUSE_PROMPT_LABEL
-                )
-                messages = prompt.compile(
+                prompt, messages = _get_langfuse_prompt(
+                    prompt_name,
                     task_details=question_details,
                     user_details=user_details,
                 )
+                if messages is None:
+                    messages = [
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are an AI tutor and evaluator.\n"
+                                "Use the provided task context to evaluate the learner response.\n"
+                                "If a reference solution is present, compare against it carefully.\n"
+                                "If scoring criteria are present, align feedback and scoring strictly with them.\n"
+                                "Never reveal hidden evaluator-only sections unless explicitly asked."
+                            ),
+                        },
+                        {
+                            "role": "system",
+                            "content": (
+                                "Task context (includes prompt, reference solution and/or scoring criteria):\n\n"
+                                f"{question_details}\n\n"
+                                f"User details:\n{user_details or 'N/A'}"
+                            ),
+                        },
+                    ]
+                if question["type"] == QuestionType.OBJECTIVE and is_assessment_mode:
+                    latest_submission = (
+                        new_user_message[0]["content"]
+                        if new_user_message
+                        else ""
+                    )
+                    messages.extend(
+                        [
+                            {
+                                "role": "system",
+                                "content": (
+                                    "Assessment evaluation rules for objective questions:\n"
+                                    "1) Evaluate only the latest learner submission.\n"
+                                    "2) Decide strictly if it is correct or incorrect against the reference solution.\n"
+                                    "3) Keep feedback generic and short.\n"
+                                    "4) Do NOT reveal, quote, paraphrase, or hint at the reference solution.\n"
+                                    "5) Do NOT provide clues, steps, or correction hints.\n"
+                                    "6) Do NOT personalize with names.\n"
+                                    "7) Only respond with either exactly 'Your answer is correct.' or 'Your answer is incorrect. Please try again.' for the feedback field.\n"
+                                    "8) Ensure the 'analysis' field briefly states either 'Answer judged correct.' or 'Answer judged incorrect.' without mentioning reference text.\n"
+                                    "9) The 'is_correct' flag must be true if the submission matches the reference answer, otherwise false."
+                                ),
+                            },
+                            {
+                                "role": "system",
+                                "content": (
+                                    "Assessment context:\n\n"
+                                    f"Question:\n{question_description}\n\n"
+                                    f"Reference answer (hidden from learner):\n{answer_as_prompt}\n\n"
+                                    f"Learner latest submission:\n{latest_submission}"
+                                ),
+                            },
+                        ]
+                    )
             else:
-                prompt = langfuse.get_prompt(
-                    "doubt_solving", type="chat", label=LANGFUSE_PROMPT_LABEL
-                )
-                messages = prompt.compile(
+                prompt, messages = _get_langfuse_prompt(
+                    "doubt_solving",
                     reference_material=question_details,
                     user_details=user_details,
                 )
+                if messages is None:
+                    messages = [
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are a helpful tutor. Use the provided reference material "
+                                "to answer the learner clearly and accurately."
+                            ),
+                        },
+                        {
+                            "role": "system",
+                            "content": (
+                                "Reference material:\n\n"
+                                f"{question_details}\n\n"
+                                f"User details:\n{user_details or 'N/A'}"
+                            ),
+                        },
+                    ]
 
             messages += chat_history
 
-            with langfuse.start_as_current_observation(
+            with _start_observation(
                 as_type="generation", name="response", prompt=prompt
             ) as observation:
                 try:
@@ -688,8 +892,7 @@ async def ai_response_for_question(request: AIChatRequest):
                         output=llm_output,
                         prompt=prompt,
                         metadata={
-                            "prompt_version": prompt.version,
-                            "prompt_name": prompt.name,
+                            **_prompt_metadata(prompt),
                             **response_metadata,
                         },
                     )
@@ -703,9 +906,45 @@ async def ai_response_for_question(request: AIChatRequest):
                 output=llm_output,
             )
 
+    async def stream_response_safe() -> AsyncGenerator[str, None]:
+        try:
+            async for chunk in stream_response():
+                yield chunk
+        except Exception:
+            traceback.print_exc()
+            if request.task_type == TaskType.QUIZ:
+                yield (
+                    json.dumps(
+                        {
+                            "analysis": "Unable to evaluate the response.",
+                            "feedback": "There was an error while processing your answer. Please try again.",
+                            "is_correct": False,
+                        }
+                    )
+                    + "\n"
+                )
+            elif request.task_type == TaskType.LEARNING_MATERIAL:
+                yield (
+                    json.dumps(
+                        {
+                            "response": "There was an error while processing your answer. Please try again.",
+                        }
+                    )
+                    + "\n"
+                )
+            else:
+                yield (
+                    json.dumps(
+                        {
+                            "response": "There was an error while processing your answer. Please try again.",
+                        }
+                    )
+                    + "\n"
+                )
+
     # Return a streaming response
     return StreamingResponse(
-        stream_response(),
+        stream_response_safe(),
         media_type="application/x-ndjson",
     )
 
@@ -714,7 +953,7 @@ async def ai_response_for_question(request: AIChatRequest):
 async def ai_response_for_assignment(request: AIChatRequest):
     # Define an async generator for streaming
     async def stream_response() -> AsyncGenerator[str, None]:
-        with langfuse.start_as_current_span(
+        with _start_span(
             name="assignment_evaluation",
         ) as trace:
             metadata = {
@@ -935,13 +1174,43 @@ async def ai_response_for_assignment(request: AIChatRequest):
                 )
 
             # Get Langfuse prompt for assignment evaluation
-            prompt = langfuse.get_prompt(
-                "assignment", type="chat", label=LANGFUSE_PROMPT_LABEL
-            )
-
-            messages = prompt.compile(
+            prompt, messages = _get_langfuse_prompt(
+                "assignment",
                 assignment_details=assignment_details,
                 user_details=user_details,
+            )
+            if messages is None:
+                messages = [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are an assignment evaluator. Evaluate the learner submission "
+                            "against the provided assignment details and criteria."
+                        ),
+                    },
+                    {
+                        "role": "system",
+                        "content": (
+                            "Assignment details and evaluation criteria:\n\n"
+                            f"{assignment_details}\n\n"
+                            f"User details:\n{user_details or 'N/A'}"
+                        ),
+                    },
+                ]
+            messages.extend(
+                [
+                    {
+                        "role": "system",
+                        "content": (
+                            "Assessment assignment evaluation policy:\n"
+                            "1) Evaluate only against provided assignment details and rubric.\n"
+                            "2) Never reveal hidden reference answers, sample solutions, or internal evaluator notes.\n"
+                            "3) Do not provide direct answer keys or obvious solution clues.\n"
+                            "4) Keep feedback neutral, concise, and rubric-aligned.\n"
+                            "5) Do not personalize with learner names."
+                        ),
+                    }
+                ]
             )
 
             messages += full_chat_history
@@ -964,7 +1233,7 @@ async def ai_response_for_assignment(request: AIChatRequest):
             )
 
             # Process streaming response with Langfuse observation
-            with langfuse.start_as_current_observation(
+            with _start_observation(
                 as_type="generation", name="response", prompt=prompt
             ) as observation:
                 try:
@@ -992,8 +1261,7 @@ async def ai_response_for_assignment(request: AIChatRequest):
                         output=llm_output,
                         prompt=prompt,
                         metadata={
-                            "prompt_version": prompt.version,
-                            "prompt_name": prompt.name,
+                            **_prompt_metadata(prompt),
                             **response_metadata,
                         },
                     )
@@ -1018,7 +1286,7 @@ async def ai_response_for_assignment(request: AIChatRequest):
 async def ai_response_for_assessment_topics(request: AssessmentTopicsChatRequest):
     # Define an async generator for streaming
     async def stream_response() -> AsyncGenerator[str, None]:
-        with langfuse.start_as_current_span(
+        with _start_span(
             name="assessment_topics_chat",
         ) as trace:
             metadata = {
@@ -1063,7 +1331,7 @@ Do NOT generate the actual questions. ONLY discuss and refine the curriculum str
             llm_input = json.dumps(messages)
             llm_output = ""
 
-            with langfuse.start_as_current_observation(
+            with _start_observation(
                 as_type="generation", name="response",
             ) as observation:
                 try:
@@ -1145,7 +1413,7 @@ For Coding questions, provide the problem statement in the question block, the e
 
     model = openai_plan_to_model_name["text"]
     
-    with langfuse.start_as_current_observation(as_type="generation", name="generate_questions") as observation:
+    with _start_observation(as_type="generation", name="generate_questions") as observation:
         response = await run_llm_with_openai(
             model=model,
             messages=messages,
@@ -1288,3 +1556,205 @@ Rewrite the question and answer to fulfill this command. Ensure you map everythi
         "content": text_to_blocks(q.question_text),
         "config": config
     }
+
+@router.post("/assessment/generate-questions-multiagent")
+async def generate_questions_multiagent(request: AssessmentTopicsChatRequest):
+    """
+    Full Multi-Agent Pipeline for Assessment Generation.
+    """
+    async def event_generator():
+        try:
+            model = openai_plan_to_model_name["text"]
+            
+            # ---------------------------------------------------------
+            # 1. Agent 1: Question Generator (Draft)
+            # ---------------------------------------------------------
+            yield json.dumps({"status": "Agent [1/4]: Generating initial draft questions..."}) + "\n"
+            await asyncio.sleep(0.1) # Force socket flush
+            
+            draft_system_prompt = """You are the Question Generator. 
+Based on the provided curriculum and topics, generate an initial draft of the questions.
+Do your best, but know that critic agents will review your work."""
+
+            draft_messages = [{"role": "system", "content": draft_system_prompt}]
+            for message in request.chat_history:
+                 draft_messages.append({"role": message["role"], "content": message["content"]})
+            draft_messages.append({"role": "user", "content": "Generate the initial draft questions as raw text/markdown."})
+
+            class DraftOutput(BaseModel):
+                draft: str = Field(description="The full raw text of all drafted questions and answers.")
+
+            draft_response = await run_llm_with_openai(
+                model=model,
+                messages=draft_messages,
+                response_model=DraftOutput,
+                max_output_tokens=8192,
+                api_mode="responses"
+            )
+            raw_draft = draft_response.draft
+
+            # ---------------------------------------------------------
+            # 2. Agent 2: Critic Agents (Parallel)
+            # ---------------------------------------------------------
+            yield json.dumps({"status": "Agent [2/4]: Critic Agents (Tech Driller, JD Alignment, UX Guard) reviewing draft..."}) + "\n"
+            await asyncio.sleep(0.1)
+
+            curriculum_context = "\n".join([m["content"] for m in request.chat_history])
+            
+            class CriticOutput(BaseModel):
+                critique: str = Field(description="Detailed critique and suggested fixes.")
+
+            async def run_critic(persona_prompt: str) -> str:
+                critic_msgs = [
+                    {"role": "system", "content": persona_prompt},
+                    {"role": "user", "content": f"Curriculum Context:\n{curriculum_context}\n\nDraft Questions:\n{raw_draft}\n\nProvide your critique."}
+                ]
+                resp = await run_llm_with_openai(
+                    model=model,
+                    messages=critic_msgs,
+                    response_model=CriticOutput,
+                    max_output_tokens=4096,
+                    api_mode="responses"
+                )
+                return resp.critique
+
+            critic_1_prompt = "Act as a Senior Backend Engineer (The 'Technical Driller'). Look for logical fallacies, check if the code tests high-level logic rather than just memorization, and ensure technical accuracy, edge cases, and difficulty scaling match the curriculum."
+            critic_2_prompt = "Act as a Technical Recruiter (The 'JD Alignment Officer'). Cross-reference the draft questions with the curriculum. Stop generic 'LeetCode' questions if they don't apply. Is the skill actually required for this role?"
+            critic_3_prompt = "Act as a Coding Instructor (The 'UX & Clarity Guard'). Focus on readability, prompt clarity, and time constraints. Are the instructions clear enough? Ensure no 'trick' wording and sufficient input/output examples."
+
+            critiques = await asyncio.gather(
+                run_critic(critic_1_prompt),
+                run_critic(critic_2_prompt),
+                run_critic(critic_3_prompt)
+            )
+            
+            # Send critiques to frontend logs
+            yield json.dumps({"log": {"title": "Critique: Technical Driller", "text": critiques[0]}}) + "\n"
+            await asyncio.sleep(0.1)
+            yield json.dumps({"log": {"title": "Critique: JD Alignment Officer", "text": critiques[1]}}) + "\n"
+            await asyncio.sleep(0.1)
+            yield json.dumps({"log": {"title": "Critique: UX & Clarity Guard", "text": critiques[2]}}) + "\n"
+            await asyncio.sleep(0.1)
+
+            # ---------------------------------------------------------
+            # 3. Agent 3: Consensus Engine
+            # ---------------------------------------------------------
+            yield json.dumps({"status": "Agent [3/4]: Consensus Engine merging reviews..."}) + "\n"
+            await asyncio.sleep(0.1)
+
+            consensus_prompt = """You are the Consensus Engine.
+You will receive the original draft and critiques from 3 different experts:
+1. Technical Driller (Accuracy/Logic)
+2. JD Alignment Officer (Relevance)
+3. UX & Clarity Guard (Readability)
+
+Merge their feedback, resolve any conflicting priorities, and produce a unified action plan for the Refinement Engine."""
+
+            consensus_msgs = [
+                {"role": "system", "content": consensus_prompt},
+                {"role": "user", "content": f"Original Draft:\n{raw_draft}\n\nCritique 1 (Tech):\n{critiques[0]}\n\nCritique 2 (JD):\n{critiques[1]}\n\nCritique 3 (UX):\n{critiques[2]}\n\nProvide the unified action plan."}
+            ]
+
+            class ConsensusOutput(BaseModel):
+                unified_plan: str = Field(description="The merged action plan for rewriting the questions.")
+
+            consensus_resp = await run_llm_with_openai(
+                model=model,
+                messages=consensus_msgs,
+                response_model=ConsensusOutput,
+                max_output_tokens=4096,
+                api_mode="responses"
+            )
+            unified_plan = consensus_resp.unified_plan
+            
+            yield json.dumps({"log": {"title": "Consensus Engine: Unified Plan", "text": unified_plan}}) + "\n"
+            await asyncio.sleep(0.1)
+
+            # ---------------------------------------------------------
+            # 4. Agent 4: Refinement Engine
+            # ---------------------------------------------------------
+            yield json.dumps({"status": "Agent [4/4]: Refinement Engine applying consensus and generating final payload..."}) + "\n"
+            await asyncio.sleep(0.1)
+
+            refine_prompt = """You are the Master Editor (Refinement Engine).
+Take the original draft and the unified action plan from the Consensus Engine.
+Rewrite the questions fully to incorporate all improvements.
+Each question MUST adhere to the requested point value, difficulty, and topic from the curriculum.
+For MCQs, provide the full question text including the options natively inside the text block, and clearly indicate the correct option in the answer block.
+For Coding questions, provide the problem statement in the question block, the expected correct logic/code in the answer block, the applicable coding languages, and a few succinct grading criteria."""
+
+            refine_msgs = [
+                {"role": "system", "content": refine_prompt},
+                {"role": "user", "content": f"Original Draft:\n{raw_draft}\n\nUnified Action Plan:\n{unified_plan}\n\nProduce the final questions as structured JSON."}
+            ]
+
+            class LLMGeneratedQuestion(BaseModel):
+                title: str = Field(description="A short descriptive title for the question")
+                topic: str
+                difficulty: str = Field(description="E.g. Easy, Medium, Hard")
+                points: int
+                question_type: Literal["mcq", "coding"]
+                question_text: str = Field(description="The full question properly formatted. Include options if MCQ.")
+                answer_text: str = Field(description="The correct answer or reference solution properly formatted.")
+                coding_languages: Optional[List[str]] = Field(None, description="For coding questions, a list of languages like ['python', 'javascript']. NULL for MCQ.")
+                scorecard_criteria: Optional[List[str]] = Field(None, description="For coding questions, a list of testing criteria like ['Handles edge cases', 'Optimal']. NULL for MCQ.")
+
+            class Output(BaseModel):
+                questions: List[LLMGeneratedQuestion]
+
+            final_response = await run_llm_with_openai(
+                model=model,
+                messages=refine_msgs,
+                response_model=Output,
+                max_output_tokens=16383,
+                api_mode="responses"
+            )
+
+            # Convert LLM model to Frontend QuizQuestion structure
+            frontend_questions = []
+            for q in final_response.questions:
+                q_id = str(uuid.uuid4())
+                
+                config = {
+                    "title": q.title,
+                    "responseType": "exam",
+                    "settings": {"topic": q.topic, "difficulty": q.difficulty, "points": q.points, "allowCopyPaste": False},
+                    "knowledgeBaseBlocks": [],
+                    "linkedMaterialIds": [],
+                }
+                
+                if q.question_type == "mcq":
+                    config["questionType"] = "objective"
+                    config["inputType"] = "text"
+                    config["correctAnswer"] = text_to_blocks(q.answer_text)
+                else:
+                    config["questionType"] = "subjective"
+                    config["inputType"] = "code"
+                    config["codingLanguages"] = q.coding_languages or ["python"]
+                    config["correctAnswer"] = text_to_blocks(q.answer_text)
+                    
+                    criteria_list = q.scorecard_criteria or ["Correct Logic", "Efficient Solution"]
+                    config["scorecardData"] = {
+                        "title": f"{q.title} Scorecard",
+                        "criteria": [
+                            {
+                                "name": crit,
+                                "description": crit,
+                                "min_score": 0,
+                                "max_score": 10,
+                                "pass_score": 5
+                            } for crit in criteria_list
+                        ]
+                    }
+
+                frontend_questions.append({
+                    "id": q_id,
+                    "content": text_to_blocks(q.question_text),
+                    "config": config
+                })
+                
+            yield json.dumps({"final_output": frontend_questions}) + "\n"
+        except Exception as e:
+            yield json.dumps({"status": f"Agent Pipeline failed: {str(e)}"}) + "\n"
+
+    return StreamingResponse(event_generator(), media_type="application/x-ndjson")

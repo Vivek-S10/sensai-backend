@@ -230,7 +230,7 @@ async def get_course(course_id: int, only_published: bool = True) -> Dict:
     # Fetch all tasks for this course
     tasks = await execute_db_operation(
         f"""SELECT t.id, t.title, t.type, t.status, t.scheduled_publish_at, ct.milestone_id, ct.ordering,
-            (CASE WHEN t.type = '{TaskType.QUIZ}' THEN 
+            (CASE WHEN t.type IN ('{TaskType.QUIZ}', '{TaskType.ASSESSMENT}') THEN 
                 (SELECT COUNT(*) FROM {questions_table_name} q 
                  WHERE q.task_id = t.id AND q.deleted_at IS NULL)
              ELSE NULL END) as num_questions,
