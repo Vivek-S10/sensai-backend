@@ -148,14 +148,14 @@ async def get_cohort_completion(
                 "is_complete": task[0] in completed_task_ids_for_user[user_id]
             }
 
-    # Get quiz and exam task questions
+    # Get quiz and assessment task questions
     query = f"""
         SELECT DISTINCT t.id as task_id, q.id as question_id
         FROM {tasks_table_name} t
         JOIN {course_tasks_table_name} ct ON t.id = ct.task_id
         JOIN {course_cohorts_table_name} cc ON ct.course_id = cc.course_id
         LEFT JOIN {questions_table_name} q ON t.id = q.task_id AND q.deleted_at IS NULL
-        WHERE cc.cohort_id = ? AND t.deleted_at IS NULL AND t.type = '{TaskType.QUIZ}' AND t.status = '{TaskStatus.PUBLISHED}' AND t.scheduled_publish_at IS NULL{
+        WHERE cc.cohort_id = ? AND t.deleted_at IS NULL AND t.type IN ('{TaskType.QUIZ}', '{TaskType.ASSESSMENT}') AND t.status = '{TaskStatus.PUBLISHED}' AND t.scheduled_publish_at IS NULL{
             " AND ct.course_id = ?" if course_id else ""
         } 
         ORDER BY t.id, q.position ASC

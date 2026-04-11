@@ -1,6 +1,7 @@
 import os
 import asyncio
 import traceback
+import re
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from typing import AsyncGenerator, Optional, Dict, Literal, List, Any
@@ -10,6 +11,11 @@ from copy import deepcopy
 from contextlib import nullcontext
 from pydantic import BaseModel, Field, create_model
 from api.config import openai_plan_to_model_name
+from api.config import (
+    chat_history_table_name,
+    user_cohorts_table_name,
+    users_table_name,
+)
 from api.models import (
     AIChatRequest,
     AssessmentTopicsChatRequest,
@@ -27,12 +33,14 @@ from api.db.task import (
     get_question,
     get_task,
     get_scorecard,
+    mark_task_completed,
 )
 from api.db.chat import (
     get_question_chat_history_for_user,
     get_task_chat_history_for_user,
 )
 from api.db.utils import construct_description_from_blocks
+from api.utils.db import execute_db_operation
 from api.utils.s3 import (
     download_file_from_s3_as_bytes,
     get_media_upload_s3_key_from_uuid,
@@ -421,6 +429,332 @@ def get_ai_message_for_chat_history(ai_message: dict) -> str:
     return f"""Feedback:\n```\n{message['feedback']}\n```\n\nScorecard:\n```\n{scorecard_as_prompt}\n```"""
 
 
+def _to_scorecard_list(scorecard_obj: Any) -> list[dict]:
+    if not scorecard_obj:
+        return []
+    if isinstance(scorecard_obj, list):
+        return scorecard_obj
+    if isinstance(scorecard_obj, dict):
+        return [{"category": category, **row} for category, row in scorecard_obj.items()]
+    return []
+
+
+def _latest_structured_assistant_payload(messages: list[dict]) -> dict:
+    latest_payload: dict = {}
+    for message in messages:
+        if message.get("role") != "assistant":
+            continue
+        try:
+            payload = json.loads(message.get("content") or "{}")
+        except Exception:
+            continue
+        if isinstance(payload, dict):
+            latest_payload = payload
+    return latest_payload
+
+
+def _latest_user_submission(messages: list[dict]) -> str:
+    for message in reversed(messages):
+        if message.get("role") == "user":
+            return message.get("content") or ""
+    return ""
+
+
+def _is_subjective_pass(scorecard_rows: list[dict]) -> bool:
+    if not scorecard_rows:
+        return False
+
+    for row in scorecard_rows:
+        score = row.get("score")
+        pass_score = row.get("pass_score")
+        max_score = row.get("max_score")
+        if score is None:
+            return False
+        if pass_score is not None:
+            if float(score) < float(pass_score):
+                return False
+        elif max_score is not None:
+            if float(score) < float(max_score):
+                return False
+        else:
+            return False
+
+    return True
+
+
+def _normalize_eval_text(text: str) -> str:
+    return " ".join(
+        "".join(ch.lower() if ch.isalnum() or ch.isspace() else " " for ch in (text or ""))
+        .split()
+    )
+
+
+def _extract_option_token(text: str) -> Optional[str]:
+    if not text:
+        return None
+    lowered = text.strip().lower()
+    if re.fullmatch(r"[a-z]", lowered):
+        return lowered
+    if re.fullmatch(r"\d+", lowered):
+        return lowered
+
+    option_match = re.search(r"\boption\s*([a-z]|\d+)\b", lowered)
+    if option_match:
+        return option_match.group(1)
+
+    leading_token_match = re.match(r"^\(?([a-z]|\d+)\)?[\.\):\-]?\s*$", lowered)
+    if leading_token_match:
+        return leading_token_match.group(1)
+    return None
+
+
+def _parse_question_options(question_text: str) -> dict[str, str]:
+    options: dict[str, str] = {}
+    if not question_text:
+        return options
+
+    for line in question_text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        letter_match = re.match(r"^\(?([A-Za-z])\)?[\.\):\-]\s*(.+)$", stripped)
+        if letter_match:
+            key = letter_match.group(1).lower()
+            value = _normalize_eval_text(letter_match.group(2))
+            if value:
+                options[key] = value
+            continue
+        number_match = re.match(r"^(\d+)[\.\):\-]\s*(.+)$", stripped)
+        if number_match:
+            key = number_match.group(1)
+            value = _normalize_eval_text(number_match.group(2))
+            if value:
+                options[key] = value
+    return options
+
+
+def _evaluate_objective_answer(
+    question_text: str, reference_answer: str, learner_submission: str
+) -> bool:
+    ref_norm = _normalize_eval_text(reference_answer)
+    sub_norm = _normalize_eval_text(learner_submission)
+
+    if not ref_norm or not sub_norm:
+        return False
+    if ref_norm == sub_norm:
+        return True
+
+    ref_token = _extract_option_token(reference_answer)
+    sub_token = _extract_option_token(learner_submission)
+    if ref_token and sub_token and ref_token == sub_token:
+        return True
+
+    option_map = _parse_question_options(question_text)
+    if sub_token and sub_token in option_map and ref_norm == option_map[sub_token]:
+        return True
+    if ref_token and ref_token in option_map and sub_norm == option_map[ref_token]:
+        return True
+
+    return False
+
+
+async def _build_assessment_report_from_db(task_id: int, user_id: int) -> dict:
+    task = await get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if task.get("type") != TaskType.ASSESSMENT:
+        raise HTTPException(status_code=400, detail="Task is not an assessment")
+
+    questions = task.get("questions") or []
+    chat_history = await get_task_chat_history_for_user(task_id, user_id)
+
+    by_question: dict[int, list[dict]] = {}
+    for message in chat_history:
+        question_id = message.get("question_id")
+        if question_id is None:
+            continue
+        by_question.setdefault(int(question_id), []).append(message)
+
+    total_weighted_score = 0.0
+    total_weighted_max = 0.0
+    objective_correct = 0
+    objective_total = 0
+    attempted = 0
+
+    modules: list[dict] = []
+    skill_map: dict[str, dict] = {}
+
+    for index, question in enumerate(questions):
+        qid = int(question["id"])
+        question_messages = by_question.get(qid, [])
+        payload = _latest_structured_assistant_payload(question_messages)
+        learner_submission = _latest_user_submission(question_messages)
+        if learner_submission:
+            attempted += 1
+
+        feedback = payload.get("feedback") or "No evaluation available."
+        competency_map = payload.get("competency_map") or []
+        scorecard_rows = _to_scorecard_list(payload.get("scorecard"))
+        module_title = question.get("title") or f"Question {index + 1}"
+
+        points = 1.0
+        settings_obj = question.get("settings") or {}
+        if isinstance(settings_obj, dict):
+            try:
+                points = float(settings_obj.get("points", 1) or 1)
+            except Exception:
+                points = 1.0
+
+        is_objective = question.get("type") == QuestionType.OBJECTIVE
+        is_correct = False
+        earned_points = 0.0
+
+        if is_objective:
+            objective_total += 1
+            question_text = construct_description_from_blocks(question.get("blocks") or [])
+            reference_answer = construct_description_from_blocks(question.get("answer") or [])
+            is_correct = _evaluate_objective_answer(
+                question_text=question_text,
+                reference_answer=reference_answer,
+                learner_submission=learner_submission,
+            )
+            if is_correct:
+                objective_correct += 1
+                earned_points = points
+        else:
+            if scorecard_rows:
+                raw_score = sum(float(row.get("score") or 0) for row in scorecard_rows)
+                raw_max = sum(
+                    float(row.get("max_score") or 0) for row in scorecard_rows
+                )
+                ratio = (raw_score / raw_max) if raw_max > 0 else 0.0
+                earned_points = round(points * ratio, 2)
+                is_correct = _is_subjective_pass(scorecard_rows)
+            else:
+                is_correct = bool(payload.get("is_correct", False))
+                if is_correct:
+                    earned_points = points
+
+        total_weighted_score += earned_points
+        total_weighted_max += points
+
+        modules.append(
+            {
+                "questionId": str(qid),
+                "module": module_title,
+                "feedback": feedback,
+                "submittedAnswer": learner_submission,
+                "isCorrect": is_correct,
+                "score": round(earned_points, 2),
+                "maxScore": round(points, 2),
+                "scorecard": scorecard_rows,
+            }
+        )
+
+        for item in competency_map:
+            sub_topic = str(item.get("sub_topic") or "General")
+            score = float(item.get("competency_score") or 0)
+            analysis = str(item.get("analysis") or "").strip()
+            current = skill_map.get(sub_topic, {"total": 0.0, "count": 0, "notes": []})
+            current["total"] += score
+            current["count"] += 1
+            if analysis:
+                current["notes"].append(analysis)
+            skill_map[sub_topic] = current
+
+    skills = []
+    for sub_topic, agg in skill_map.items():
+        avg = (agg["total"] / agg["count"]) if agg["count"] > 0 else 0.0
+        skills.append(
+            {
+                "subTopic": sub_topic,
+                "avgScore": round(avg, 1),
+                "note": agg["notes"][0] if agg["notes"] else "",
+            }
+        )
+    skills.sort(key=lambda x: x["avgScore"], reverse=True)
+
+    return {
+        "attempted": attempted,
+        "totalQuestions": len(questions),
+        "objectiveCorrect": objective_correct,
+        "objectiveTotal": objective_total,
+        "rubricScore": round(total_weighted_score, 2),
+        "rubricMax": round(total_weighted_max, 2),
+        "skills": skills,
+        "modules": modules,
+    }
+
+
+async def _store_assessment_report_snapshot(
+    task_id: int, user_id: int, report: dict
+) -> None:
+    await execute_db_operation(
+        f"""
+        UPDATE {chat_history_table_name}
+        SET deleted_at = CURRENT_TIMESTAMP
+        WHERE user_id = ? AND task_id = ? AND role = 'assistant' AND response_type = 'assessment_report' AND deleted_at IS NULL
+        """,
+        (user_id, task_id),
+    )
+    await execute_db_operation(
+        f"""
+        INSERT INTO {chat_history_table_name} (user_id, task_id, role, content, response_type)
+        VALUES (?, ?, 'assistant', ?, 'assessment_report')
+        """,
+        (user_id, task_id, json.dumps({"assessment_report": report})),
+    )
+
+
+async def _build_assessment_leaderboard(cohort_id: int, task_id: int) -> list[dict]:
+    users = await execute_db_operation(
+        f"""
+        SELECT u.id, u.first_name, u.email
+        FROM {user_cohorts_table_name} uc
+        JOIN {users_table_name} u ON u.id = uc.user_id
+        WHERE uc.cohort_id = ? AND uc.role = 'learner' AND uc.deleted_at IS NULL AND u.deleted_at IS NULL
+        """,
+        (cohort_id,),
+        fetch_all=True,
+    )
+
+    if not users:
+        return []
+
+    leaderboard_rows = []
+    for row in users:
+        learner_id = int(row[0])
+        report = await _build_assessment_report_from_db(task_id, learner_id)
+        rubric_max = float(report.get("rubricMax") or 0)
+        rubric_score = float(report.get("rubricScore") or 0)
+        percentage = round((rubric_score / rubric_max) * 100, 2) if rubric_max > 0 else 0
+        leaderboard_rows.append(
+            {
+                "user": {
+                    "id": learner_id,
+                    "first_name": row[1],
+                    "email": row[2],
+                },
+                "attempted": report.get("attempted", 0),
+                "total_questions": report.get("totalQuestions", 0),
+                "total_score": rubric_score,
+                "max_score": rubric_max,
+                "percentage": percentage,
+            }
+        )
+
+    leaderboard_rows.sort(
+        key=lambda x: (x["percentage"], x["total_score"], x["attempted"]), reverse=True
+    )
+    return leaderboard_rows
+
+
+class AssessmentSubmitRequest(BaseModel):
+    user_id: int
+    task_id: int
+    cohort_id: Optional[int] = None
+
+
 async def get_user_details_for_prompt(user_id: str) -> str:
     user_first_name = await get_user_first_name(user_id)
 
@@ -633,25 +967,65 @@ async def ai_response_for_question(request: AIChatRequest):
                 latest_submission = (
                     new_user_message[0]["content"] if new_user_message else ""
                 )
-                def normalize(text: str) -> str:
-                    return text.strip().casefold()
-
-                is_correct = (
-                    normalize(latest_submission)
-                    == normalize(objective_reference or "")
-                    if objective_reference
-                    else False
+                is_assessment_mode = question.get("response_type") != "chat"
+                is_correct = _evaluate_objective_answer(
+                    question_text=question_description,
+                    reference_answer=objective_reference or "",
+                    learner_submission=latest_submission,
                 )
+
                 feedback = (
                     "Your answer is correct."
                     if is_correct
-                    else "Your answer is incorrect. Please try again."
+                    else "Your answer is incorrect. Please review the question and your selected option, then try again."
                 )
-                analysis = (
-                    "Answer judged correct."
-                    if is_correct
-                    else "Answer judged incorrect."
-                )
+                analysis = "Answer judged correct." if is_correct else "Answer judged incorrect."
+
+                if is_assessment_mode:
+                    class AssessmentObjectiveFeedback(BaseModel):
+                        analysis: str = Field(
+                            description="Concise evaluator analysis. Do not reveal the reference answer."
+                        )
+                        feedback: str = Field(
+                            description="Concise feedback for the learner. If incorrect, explain why it is wrong without revealing the correct answer."
+                        )
+
+                    feedback_messages = [
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are an assessment evaluator.\n"
+                                "Never reveal, quote, or hint at the reference answer.\n"
+                                "If incorrect, explain briefly why the learner response is not aligned with the question requirement.\n"
+                                "Do not provide steps, clues, or correction hints.\n"
+                                "Do not personalize with names."
+                            ),
+                        },
+                        {
+                            "role": "system",
+                            "content": (
+                                f"Question:\n{question_description}\n\n"
+                                f"Reference answer (hidden from learner):\n{objective_reference or ''}\n\n"
+                                f"Learner submission:\n{latest_submission}\n\n"
+                                f"Correctness verdict (must follow this exactly): {is_correct}"
+                            ),
+                        },
+                    ]
+                    try:
+                        feedback_output = await run_llm_with_openai(
+                            model=openai_plan_to_model_name["text-mini"],
+                            messages=feedback_messages,
+                            response_model=AssessmentObjectiveFeedback,
+                            max_output_tokens=300,
+                            api_mode="responses",
+                        )
+                        if feedback_output.analysis:
+                            analysis = feedback_output.analysis
+                        if feedback_output.feedback:
+                            feedback = feedback_output.feedback
+                    except Exception:
+                        pass
+
                 llm_output = {
                     "analysis": analysis,
                     "feedback": feedback,
@@ -821,9 +1195,10 @@ async def ai_response_for_question(request: AIChatRequest):
                                     "4) Do NOT reveal, quote, paraphrase, or hint at the reference solution.\n"
                                     "5) Do NOT provide clues, steps, or correction hints.\n"
                                     "6) Do NOT personalize with names.\n"
-                                    "7) Only respond with either exactly 'Your answer is correct.' or 'Your answer is incorrect. Please try again.' for the feedback field.\n"
-                                    "8) Ensure the 'analysis' field briefly states either 'Answer judged correct.' or 'Answer judged incorrect.' without mentioning reference text.\n"
-                                    "9) The 'is_correct' flag must be true if the submission matches the reference answer, otherwise false."
+                                    "7) If correct, keep feedback short and positive.\n"
+                                    "8) If incorrect, provide a short generic reason why the submission does not match the requirement, without revealing the reference answer.\n"
+                                    "9) Ensure the 'analysis' field states whether the answer is correct or incorrect without mentioning reference text.\n"
+                                    "10) The 'is_correct' flag must be true if the submission matches the reference answer, otherwise false."
                                 ),
                             },
                             {
@@ -947,6 +1322,35 @@ async def ai_response_for_question(request: AIChatRequest):
         stream_response_safe(),
         media_type="application/x-ndjson",
     )
+
+
+@router.post("/assessment/submit")
+async def submit_assessment(request: AssessmentSubmitRequest):
+    report = await _build_assessment_report_from_db(request.task_id, request.user_id)
+
+    await _store_assessment_report_snapshot(
+        task_id=request.task_id, user_id=request.user_id, report=report
+    )
+    await mark_task_completed(request.task_id, request.user_id)
+
+    leaderboard = []
+    if request.cohort_id is not None:
+        leaderboard = await _build_assessment_leaderboard(
+            cohort_id=request.cohort_id, task_id=request.task_id
+        )
+
+    return {
+        "report": report,
+        "leaderboard": leaderboard,
+    }
+
+
+@router.get("/assessment/leaderboard")
+async def get_assessment_leaderboard(task_id: int, cohort_id: int):
+    leaderboard = await _build_assessment_leaderboard(
+        cohort_id=cohort_id, task_id=task_id
+    )
+    return {"stats": leaderboard}
 
 
 @router.post("/assignment")
